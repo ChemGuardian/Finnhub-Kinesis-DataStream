@@ -11,18 +11,20 @@ from websocket import WebSocketApp
 # ========= Konfiguration =========
 
 AWS_REGION = "eu-central-1"
-KINESIS_STREAM = "bdcloud01-kinesis01"  # Stream-Name
+KINESIS_STREAM = "bdcloud01-kinesis01"
 
-SUPER_SAMPLE_FACTOR = 1000  # Faktor fürs Supersampling
-
-# Symbole, die du abonnieren willst
-SYMBOLS = ["BINANCE:BTCUSDT", "BINANCE:ETHUSDT", "OANDA:EUR_USD"]
-# nach Bedarf anpassen
-
-# Buffer für batched Writes nach Kinesis
-BUFFER = []
-BUFFER_SIZE = 2000  # ab wie vielen Records sofort geflusht wird
+SUPER_SAMPLE_FACTOR = 100  # Supersampling-Faktor
+BUFFER_SIZE = 2000  # ab wie vielen Records wir sofort flushen
 FLUSH_INTERVAL_SECONDS = 1.0  # spätestens alle x Sekunden flushen
+MAX_RECORDS_PER_BATCH = 500  # AWS-Limit für PutRecords
+
+SYMBOLS = [
+    "BINANCE:BTCUSDT",
+    "BINANCE:ETHUSDT",
+    "OANDA:EUR_USD",
+]
+
+BUFFER = []
 BUFFER_LOCK = threading.Lock()
 
 FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
@@ -31,14 +33,51 @@ if not FINNHUB_TOKEN:
 
 WS_URL = f"wss://ws.finnhub.io?token={FINNHUB_TOKEN}"
 
-# Kinesis Client
 kinesis = boto3.client(
     "kinesis",
     region_name=AWS_REGION,
     config=Config(retries={"max_attempts": 5, "mode": "standard"}),
 )
 
-# ========= Kinesis Buffer / Flush =========
+# ========= Hilfsfunktion: in Batches nach Kinesis schicken =========
+
+
+def send_records(records, context="FLUSH"):
+    """
+    records: Liste von Dicts
+    Schickt in Batches von höchstens 500 Records nach Kinesis.
+    """
+    total = len(records)
+    if total == 0:
+        return
+
+    try:
+        sent = 0
+        failed_total = 0
+
+        for start in range(0, total, MAX_RECORDS_PER_BATCH):
+            batch = records[start : start + MAX_RECORDS_PER_BATCH]
+
+            entries = [
+                {
+                    "Data": json.dumps(rec).encode("utf-8"),
+                    "PartitionKey": rec.get("symbol", "unknown"),
+                }
+                for rec in batch
+            ]
+
+            resp = kinesis.put_records(Records=entries, StreamName=KINESIS_STREAM)
+            failed = resp.get("FailedRecordCount", 0)
+            failed_total += failed
+            sent += len(batch)
+
+        print(f"[{context}] {sent} Records → Kinesis, failed: {failed_total}")
+
+    except Exception as e:
+        print(f"[{context}-ERROR] Fehler beim Schreiben nach Kinesis: {e}")
+
+
+# ========= Kinesis Buffer / periodischer Flush =========
 
 
 def flush_buffer():
@@ -53,20 +92,7 @@ def flush_buffer():
             records = BUFFER
             BUFFER = []
 
-        entries = [
-            {
-                "Data": json.dumps(rec).encode("utf-8"),
-                "PartitionKey": rec.get("symbol", "unknown"),
-            }
-            for rec in records
-        ]
-
-        try:
-            resp = kinesis.put_records(Records=entries, StreamName=KINESIS_STREAM)
-            failed = resp.get("FailedRecordCount", 0)
-            print(f"[FLUSH] {len(records)} Records → Kinesis, failed: {failed}")
-        except Exception as e:
-            print(f"[FLUSH-ERROR] Fehler beim Schreiben nach Kinesis: {e}")
+        send_records(records, context="FLUSH")
 
 
 # ========= WebSocket Callbacks =========
@@ -81,16 +107,6 @@ def on_open(ws):
 
 
 def on_message(ws, message):
-    """
-    Erwartete Finnhub-Message:
-    {
-      "type": "trade",
-      "data": [
-        { "p": 261.74, "s": "AAPL", "t": 1582641634534, "v": 100 },
-        ...
-      ]
-    }
-    """
     global BUFFER
     try:
         payload = json.loads(message)
@@ -102,16 +118,15 @@ def on_message(ws, message):
 
         with BUFFER_LOCK:
             for trade in trades:
-                # Supersampling: aus jedem echten Trade SUPER_SAMPLE_FACTOR Records machen
                 for i in range(SUPER_SAMPLE_FACTOR):
                     rec = {
                         "symbol": trade.get("s"),
                         "price": trade.get("p"),
                         "volume": trade.get("v"),
-                        "trade_ts": trade.get("t"),  # Originalzeitpunkt des Trades (ms)
-                        "ingest_ts": now_ms,  # Zeitpunkt der Verarbeitung
-                        "sample_idx": i,  # Index dieses Samples
-                        "sample_id": str(uuid.uuid4()),  # eindeutige ID pro Sample
+                        "trade_ts": trade.get("t"),
+                        "ingest_ts": now_ms,
+                        "sample_idx": i,
+                        "sample_id": str(uuid.uuid4()),
                         "source": "finnhub_ws_trade_supersampled",
                     }
                     BUFFER.append(rec)
@@ -120,24 +135,7 @@ def on_message(ws, message):
             if len(BUFFER) >= BUFFER_SIZE:
                 records = BUFFER
                 BUFFER = []
-
-                entries = [
-                    {
-                        "Data": json.dumps(r).encode("utf-8"),
-                        "PartitionKey": r.get("symbol", "unknown"),
-                    }
-                    for r in records
-                ]
-                try:
-                    resp = kinesis.put_records(
-                        Records=entries, StreamName=KINESIS_STREAM
-                    )
-                    failed = resp.get("FailedRecordCount", 0)
-                    print(
-                        f"[FLUSH-IMMEDIATE] {len(records)} Records → Kinesis, failed: {failed}"
-                    )
-                except Exception as e:
-                    print(f"[FLUSH-IMMEDIATE-ERROR] {e}")
+                send_records(records, context="FLUSH-IMMEDIATE")
 
     except Exception as e:
         print(f"[WS-ERROR] Fehler beim Verarbeiten von Message: {e}")
@@ -155,7 +153,6 @@ def on_close(ws, close_status_code, close_msg):
 
 
 def main():
-    # Hintergrund-Thread zum periodischen Flush
     t = threading.Thread(target=flush_buffer, daemon=True)
     t.start()
 
