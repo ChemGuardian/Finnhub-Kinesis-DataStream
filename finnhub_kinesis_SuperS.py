@@ -16,7 +16,8 @@ KINESIS_STREAM = "bdcloud01-kinesis01"  # Stream-Name
 SUPER_SAMPLE_FACTOR = 1000  # Faktor fürs Supersampling
 
 # Symbole, die du abonnieren willst
-SYMBOLS = ["AAPL", "MSFT", "GOOGL"]  # nach Bedarf anpassen
+SYMBOLS = ["BINANCE:BTCUSDT", "BINANCE:ETHUSDT", "OANDA:EUR_USD"]
+# nach Bedarf anpassen
 
 # Buffer für batched Writes nach Kinesis
 BUFFER = []
