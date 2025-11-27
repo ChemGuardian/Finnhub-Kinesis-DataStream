@@ -13,8 +13,8 @@ from websocket import WebSocketApp
 AWS_REGION = "eu-central-1"
 KINESIS_STREAM = "bdcloud01-kinesis01"
 
-SUPER_SAMPLE_FACTOR = 100  # Supersampling-Faktor
-BUFFER_SIZE = 2000  # ab wie vielen Records wir sofort flushen
+SUPER_SAMPLE_FACTOR = 10  # Supersampling-Faktor
+BUFFER_SIZE = 1000  # ab wie vielen Records wir sofort flushen
 FLUSH_INTERVAL_SECONDS = 1.0  # spätestens alle x Sekunden flushen
 MAX_RECORDS_PER_BATCH = 500  # AWS-Limit für PutRecords
 
